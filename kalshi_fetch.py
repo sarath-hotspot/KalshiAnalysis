@@ -32,7 +32,7 @@ REQUEST_DELAY = 0.25  # seconds between paginated requests to stay polite
 OUTPUT_FILE = Path(__file__).with_name("kalshi_sports_data.csv")
 STATE_FILE = Path(__file__).with_name("kalshi_fetch_state.json")
 FIELDNAMES = ["SeriesTicker", "SeriesName", "EventTicker", "MarketTicker", "Time",
-              "EventEndTime", "VolumeInDollar", "YesProb", "NoProb", "EventResult",
+              "EventEndTime", "VolumeInDollar", "OpenInterest", "YesProb", "NoProb", "EventResult",
               "RulesPrimary", "KalshiURL", "Tags"]
 
 logging.basicConfig(
@@ -140,20 +140,21 @@ def _extract_price(candle: dict) -> int | None:
     )
 
 
-def get_yes_prob_before_close(series_ticker: str, market: dict, hours_before: float = 6) -> float | None:
+def get_yes_prob_before_close(series_ticker: str, market: dict, hours_before: float = 6) -> tuple:
     """
-    Use hourly candlestick data to find the YES probability approximately
-    *hours_before* hours before the market's close_time.
+    Use hourly candlestick data to find the YES probability and open interest
+    approximately *hours_before* hours before the market's close_time.
 
     Strategy:
       1. Look in a 2-hour window centred on the target.
-      2. If no candle with price data exists there, return (None, None).
+      2. If no candle with price data exists there, return (None, None, None).
 
-    Returns (probability, snapshot_time_iso) or (None, None) if unavailable.
+    Returns (probability, snapshot_time_iso, open_interest) or (None, None, None)
+    if unavailable.
     """
     close_time_str = market.get("close_time")
     if not close_time_str:
-        return None, None
+        return None, None, None
 
     close_dt = datetime.fromisoformat(close_time_str.replace("Z", "+00:00"))
     target_dt = close_dt - timedelta(hours=hours_before)
@@ -177,7 +178,7 @@ def get_yes_prob_before_close(series_ticker: str, market: dict, hours_before: fl
     priced = [c for c in candles if _extract_price(c) is not None]
 
     if not priced:
-        return None, None
+        return None, None, None
 
     # Pick the candle closest to the target timestamp
     best = min(priced, key=lambda c: abs(c.get("end_period_ts", 0) - target_ts))
@@ -187,7 +188,10 @@ def get_yes_prob_before_close(series_ticker: str, market: dict, hours_before: fl
     snap_ts = best.get("end_period_ts", target_ts)
     snap_time = datetime.fromtimestamp(snap_ts, tz=timezone.utc).isoformat(timespec="seconds")
 
-    return round(price_cents / 100.0, 4), snap_time  # cents → probability
+    # Open interest from the candlestick (contracts outstanding at end of period)
+    open_interest = best.get("open_interest", 0) or 0
+
+    return round(price_cents / 100.0, 4), snap_time, open_interest  # cents → probability
 
 
 def compute_volume_dollars(market: dict) -> str:
@@ -355,7 +359,7 @@ def main():
 
             log.info("  [%d/%d] %s  result=%s", midx, len(markets), ticker, result)
 
-            yes_prob, snap_time = get_yes_prob_before_close(sticker, mkt, args.hours_before)
+            yes_prob, snap_time, open_interest = get_yes_prob_before_close(sticker, mkt, args.hours_before)
             if yes_prob is None:
                 log.warning("    No candlestick price data at all for %s – skipping.", ticker)
                 continue
@@ -373,6 +377,7 @@ def main():
                 "Time": snap_time,
                 "EventEndTime": close_time,
                 "VolumeInDollar": volume_dollars,
+                "OpenInterest": open_interest,
                 "YesProb": yes_prob,
                 "NoProb": no_prob,
                 "EventResult": result,

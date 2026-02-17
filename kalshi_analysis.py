@@ -15,6 +15,7 @@ DATA_FILE = Path(__file__).with_name("kalshi_sports_data.csv")
 
 CONFIDENCE_THRESHOLDS = [50, 55, 60, 65, 70, 75, 80, 85, 90]
 VOLUME_THRESHOLDS = [0, 1_000, 10_000, 100_000, 500_000, 1_000_000]
+OPEN_INTEREST_THRESHOLDS = [0, 100, 500, 1_000, 5_000, 10_000, 50_000]
 
 
 def load_data(path: Path) -> list[dict]:
@@ -99,6 +100,19 @@ def _fmt_vol(v: float) -> str:
     return f"${v:.0f}"
 
 
+def _open_interest(row: dict) -> int:
+    """Return open interest (contracts outstanding at snapshot time)."""
+    return int(row.get("OpenInterest", 0) or 0)
+
+
+def _fmt_oi(v: int) -> str:
+    if v >= 1_000_000:
+        return f"{v / 1_000_000:.0f}M"
+    if v >= 1_000:
+        return f"{v / 1_000:.0f}K"
+    return f"{v}"
+
+
 def print_accuracy_table(rows: list[dict]) -> None:
     # Filter out "done games" (favourite prob > 90%)
     competitive = [r for r in rows if _favourite_prob(r) <= 0.90]
@@ -177,11 +191,58 @@ def print_confidence_for_volume_ranges(rows: list[dict]) -> None:
         print(f"{cumulative_all['range']:<16} {cumulative_all['total']:>4} {cumulative_all['correct']:>8} {cumulative_all['incorrect']:>6} {cumulative_all['accuracy']:>8.2f}%")
 
 
+def print_confidence_for_open_interest_ranges(rows: list[dict]) -> None:
+    """Print a confidence-band accuracy table for each open interest range."""
+    for i, oi_lo in enumerate(OPEN_INTEREST_THRESHOLDS):
+        oi_hi = OPEN_INTEREST_THRESHOLDS[i + 1] if i + 1 < len(OPEN_INTEREST_THRESHOLDS) else float("inf")
+        label = f"{_fmt_oi(oi_lo)}-{_fmt_oi(int(oi_hi))}" if oi_hi != float("inf") else f">{_fmt_oi(oi_lo)}"
+
+        subset = [r for r in rows if oi_lo <= _open_interest(r) < oi_hi]
+        if not subset:
+            print(f"\n=== Open Interest {label}: 0 markets — skipping ===")
+            continue
+
+        competitive = [r for r in subset if _favourite_prob(r) <= 0.90]
+        done_games = len(subset) - len(competitive)
+
+        print(f"\n=== Open Interest {label} ===")
+        print(f"Markets: {len(subset)} | Competitive: {len(competitive)} | Done games (>90%): {done_games}\n")
+
+        table = []
+        for j, lo in enumerate(CONFIDENCE_THRESHOLDS):
+            hi = CONFIDENCE_THRESHOLDS[j + 1] if j + 1 < len(CONFIDENCE_THRESHOLDS) else 100
+            source = subset if lo >= 90 else competitive
+            stats = accuracy_at_threshold(source, lo, hi)
+            table.append(stats)
+
+        cumulative = accuracy_at_threshold(competitive, 50, 100)
+        cumulative["range"] = "ALL >50%"
+        cumulative_all = accuracy_at_threshold(subset, 50, 100)
+        cumulative_all["range"] = "ALL (incl >90%)"
+
+        hdr = f"{'Confidence':<14} {'Total':>6} {'Correct':>8} {'Wrong':>6} {'Accuracy':>9}"
+        sep = "-" * len(hdr)
+        print(hdr)
+        print(sep)
+        for s in table:
+            print(f"{s['range']:<14} {s['total']:>6} {s['correct']:>8} {s['incorrect']:>6} {s['accuracy']:>8.2f}%")
+        print(sep)
+        print(f"{cumulative['range']:<14} {cumulative['total']:>6} {cumulative['correct']:>8} {cumulative['incorrect']:>6} {cumulative['accuracy']:>8.2f}%")
+        print(f"{cumulative_all['range']:<16} {cumulative_all['total']:>4} {cumulative_all['correct']:>8} {cumulative_all['incorrect']:>6} {cumulative_all['accuracy']:>8.2f}%")
+
+
 def main():
     rows = load_data(DATA_FILE)
     print(f"Loaded {len(rows)} rows from {DATA_FILE.name}\n")
     print_accuracy_table(rows)
+    print("\n" + "=" * 60)
+    print("  ANALYSIS BY VOLUME")
+    print("=" * 60)
     print_confidence_for_volume_ranges(rows)
+    print("\n" + "=" * 60)
+    print("  ANALYSIS BY OPEN INTEREST")
+    print("=" * 60)
+    print_confidence_for_open_interest_ranges(rows)
 
 
 if __name__ == "__main__":
