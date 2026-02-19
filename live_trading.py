@@ -35,9 +35,11 @@ ENV_DIR = Path(__file__).with_name("env")
 
 # Strategy defaults (overridable via CLI)
 BET_AMOUNT_DOLLARS = 1.0        # Total dollars to spend per market
-VOLUME_MIN = 100                # Minimum market volume ($)
-VOLUME_MAX = 500                # Maximum market volume ($)
-YES_PROB_THRESHOLD = 0.65       # Bet NO when YES prob exceeds this
+BET_CONTRACTS = 1               # Number of contracts to buy per market (takes priority over bet_amount)
+VOLUME_MIN = 100_000                # Minimum market volume ($)
+VOLUME_MAX = 500_000                # Maximum market volume ($)
+YES_PROB_MIN = 0.60             # Bet NO when YES prob exceeds this
+YES_PROB_MAX = 0.90             # Skip markets where YES prob exceeds this
 HOURS_AHEAD = 6                 # Look at games closing within N hours
 BASKETBALL_TAG = "Basketball"
 SPORTS_CATEGORY = "Sports"
@@ -78,9 +80,18 @@ def load_credentials() -> tuple:
 
 
 def _sign(private_key, timestamp_ms: str, method: str, path: str) -> str:
-    """RSA-PKCS1v15-SHA256 signature of  timestamp + METHOD + path ."""
-    message = f"{timestamp_ms}{method.upper()}{path}".encode("utf-8")
-    sig = private_key.sign(message, padding.PKCS1v15(), hashes.SHA256())
+    """RSA-PSS-SHA256 signature of  timestamp + METHOD + path (no query string)."""
+    # Strip query string from path for signing
+    clean_path = path.split("?")[0]
+    message = f"{timestamp_ms}{method.upper()}{clean_path}".encode("utf-8")
+    sig = private_key.sign(
+        message,
+        padding.PSS(
+            mgf=padding.MGF1(hashes.SHA256()),
+            salt_length=padding.PSS.DIGEST_LENGTH,
+        ),
+        hashes.SHA256(),
+    )
     return base64.b64encode(sig).decode("utf-8")
 
 
@@ -193,6 +204,7 @@ class KalshiClient:
             s for s in all_series
             if s.get("category", "").lower() == SPORTS_CATEGORY.lower()
             and BASKETBALL_TAG.lower() in [t.lower() for t in (s.get("tags") or [])]
+            and s.get("ticker").lower().endswith("game")
         ]
         log.info("Found %d basketball series out of %d total.", len(basketball), len(all_series))
         return basketball
@@ -218,7 +230,7 @@ class KalshiClient:
                 params={"series_ticker": sticker, "status": "open"},
             )
             for m in markets:
-                close_str = m.get("close_time") or m.get("expiration_time") or ""
+                close_str = m.get("expected_expiration_time") or m.get("close_time") or m.get("expiration_time") or ""
                 if not close_str:
                     continue
                 close_dt = datetime.fromisoformat(close_str.replace("Z", "+00:00"))
@@ -234,15 +246,18 @@ class KalshiClient:
     # ------------------------------------------------------------------
 
     def get_no_position(self, ticker: str) -> int:
-        """Return total NO contracts we currently hold for *ticker*."""
+        """Return total NO contracts we currently hold for *ticker*.
+        position_fp is negative for NO positions, positive for YES."""
         data = self._get("/portfolio/positions", params={"ticker": ticker})
         positions = data.get("market_positions", [])
-        total = 0
         for pos in positions:
             if pos.get("ticker") == ticker:
-                # Kalshi may report as separate fields or a signed 'position'
-                total += pos.get("no_contracts", 0) or 0
-        return total
+                position_fp = float(pos.get("position_fp", 0) or 0)
+                # Negative means NO contracts held
+                if position_fp < 0:
+                    return int(abs(position_fp))
+                return 0
+        return 0
 
     def get_resting_no_orders(self, ticker: str) -> int:
         """Return NO contracts in resting (open) buy orders for *ticker*."""
@@ -261,19 +276,29 @@ class KalshiClient:
         return self.get_no_position(ticker) + self.get_resting_no_orders(ticker)
 
     # ------------------------------------------------------------------
+    # Market data
+    # ------------------------------------------------------------------
+
+    def get_market(self, ticker: str) -> dict:
+        """Fetch the latest market data for a single ticker."""
+        data = self._get(f"/markets/{ticker}")
+        return data.get("market", data)
+
+    # ------------------------------------------------------------------
     # Order placement
     # ------------------------------------------------------------------
 
-    def place_no_order(self, ticker: str, count: int) -> dict:
-        """Place a market order to BUY *count* NO contracts."""
+    def place_no_order(self, ticker: str, count: int, no_price_cents: int) -> dict:
+        """Place a market order to BUY *count* NO contracts at *no_price_cents*."""
         body = {
             "action": "buy",
             "side": "no",
             "count": count,
             "type": "market",
             "ticker": ticker,
+            "no_price": no_price_cents,
         }
-        log.info("  >> Placing order: BUY %d NO on %s", count, ticker)
+        log.info("  >> Placing order: BUY %d NO on %s @ %d¢", count, ticker, no_price_cents)
         return self._post("/portfolio/orders", body)
 
 
@@ -312,16 +337,19 @@ def _no_price_cents(market: dict) -> int:
 
 def run(client: KalshiClient, *,
         bet_amount: float,
+        bet_contracts: int,
         volume_min: float,
         volume_max: float,
-        yes_threshold: float,
+        yes_min_threshold: float,
+        yes_max_threshold: float,
         hours: float,
         dry_run: bool):
     log.info("=" * 60)
     log.info("Kalshi Live Trading Bot — Basketball NO Strategy")
     log.info("  Volume range  : $%.0f – $%.0f", volume_min, volume_max)
-    log.info("  YES threshold : >%.0f%%", yes_threshold * 100)
-    log.info("  Bet amount    : $%.2f per market", bet_amount)
+    log.info("  YES threshold : %.0f%%–%.0f%%", yes_min_threshold * 100, yes_max_threshold * 100)
+    log.info("  Bet contracts : %d", bet_contracts)
+    log.info("  Bet amount    : $%.2f (fallback if --bet-contracts not set)", bet_amount)
     log.info("  Time window   : next %.1f hours", hours)
     log.info("  Mode          : %s", "DRY RUN" if dry_run else "LIVE")
     log.info("=" * 60)
@@ -351,23 +379,26 @@ def run(client: KalshiClient, *,
             log.info("     SKIP  volume $%.0f outside $%.0f–$%.0f", volume, volume_min, volume_max)
             continue
 
-        # 3 — Filter: YES prob > threshold
-        if yes_p <= yes_threshold:
-            log.info("     SKIP  YES %.1f%% <= %.0f%% threshold", yes_p * 100, yes_threshold * 100)
+        # 3 — Filter: YES prob within threshold range
+        if yes_p <= yes_min_threshold:
+            log.info("     SKIP  YES %.1f%% <= %.0f%% min threshold", yes_p * 100, yes_min_threshold * 100)
+            continue
+        if yes_p > yes_max_threshold:
+            log.info("     SKIP  YES %.1f%% > %.0f%% max threshold", yes_p * 100, yes_max_threshold * 100)
             continue
 
         candidates += 1
 
         # Calculate desired NO contract count
+        # bet_contracts takes priority; fall back to bet_amount / price
         if no_p_cents <= 0:
             log.warning("     SKIP  NO price is 0")
             continue
-        desired = int(bet_amount * 100) // no_p_cents
-        if desired < 1:
-            desired = 1
+        desired = bet_contracts if bet_contracts > 0 else max(int(bet_amount * 100) // no_p_cents, 1)
 
         # 4 — Check existing position / orders
         existing = client.existing_no_contracts(ticker)
+        log.info("     Currently hold %d NO contracts (including resting orders)", existing)
         if existing >= desired:
             log.info("     SKIP  already hold %d NO (need %d)", existing, desired)
             bets_skipped += 1
@@ -377,12 +408,27 @@ def run(client: KalshiClient, *,
         if existing > 0:
             log.info("     Have %d NO, placing %d more", existing, missing)
 
-        # 5 — Place order
+        # 5 — Refresh market data for latest prices before ordering
+        fresh = client.get_market(ticker)
+        fresh_no_cents = _no_price_cents(fresh)
+        fresh_yes_p = _yes_prob(fresh)
+        if fresh_no_cents != no_p_cents:
+            log.info("     Price refreshed: NO %d¢ → %d¢, YES %.1f%% → %.1f%%",
+                     no_p_cents, fresh_no_cents, yes_p * 100, fresh_yes_p * 100)
+        if fresh_no_cents <= 0:
+            log.warning("     SKIP  refreshed NO price is 0")
+            continue
+
+        # Recalculate count with fresh price
+        desired = bet_contracts if bet_contracts > 0 else max(int(bet_amount * 100) // fresh_no_cents, 1)
+        missing = max(desired - existing, 1)
+
+        # 6 — Place order
         if dry_run:
-            log.info("     [DRY RUN] would BUY %d NO on %s", missing, ticker)
+            log.info("     [DRY RUN] would BUY %d NO on %s @ %d¢", missing, ticker, fresh_no_cents)
             bets_placed += 1
         else:
-            result = client.place_no_order(ticker, missing)
+            result = client.place_no_order(ticker, missing, fresh_no_cents)
             if result:
                 log.info("     OK  order submitted (%d NO)", missing)
                 bets_placed += 1
@@ -410,16 +456,20 @@ def main():
         description="Kalshi Basketball NO-bet trading bot",
     )
     parser.add_argument("--bet-amount", type=float, default=BET_AMOUNT_DOLLARS,
-                        help="Dollars to spend per market (default: $%(default).2f)")
+                        help="Dollars to spend per market, used when --bet-contracts is 0 (default: $%(default).2f)")
+    parser.add_argument("--bet-contracts", type=int, default=BET_CONTRACTS,
+                        help="Number of contracts per market; takes priority over --bet-amount (default: %(default)s)")
     parser.add_argument("--volume-min", type=float, default=VOLUME_MIN,
                         help="Min volume in $ (default: %(default)s)")
     parser.add_argument("--volume-max", type=float, default=VOLUME_MAX,
                         help="Max volume in $ (default: %(default)s)")
-    parser.add_argument("--yes-threshold", type=float, default=YES_PROB_THRESHOLD * 100,
-                        help="YES probability threshold %% (default: %(default)s)")
+    parser.add_argument("--yes-min", type=float, default=YES_PROB_MIN * 100,
+                        help="Min YES probability threshold %% (default: %(default)s)")
+    parser.add_argument("--yes-max", type=float, default=YES_PROB_MAX * 100,
+                        help="Max YES probability threshold %% (default: %(default)s)")
     parser.add_argument("--hours", type=float, default=HOURS_AHEAD,
                         help="Look-ahead window in hours (default: %(default)s)")
-    parser.add_argument("--dry-run", default=True, action="store_true",
+    parser.add_argument("--dry-run", default=False, action="store_true",
                         help="Preview actions without placing real orders")
     args = parser.parse_args()
 
@@ -428,13 +478,22 @@ def main():
     run(
         client,
         bet_amount=args.bet_amount,
+        bet_contracts=args.bet_contracts,
         volume_min=args.volume_min,
         volume_max=args.volume_max,
-        yes_threshold=args.yes_threshold / 100.0,
+        yes_min_threshold=args.yes_min / 100.0,
+        yes_max_threshold=args.yes_max / 100.0,
         hours=args.hours,
         dry_run=args.dry_run,
     )
 
 
+def test_endpoints():
+    client = KalshiClient()
+    market_ticker = "KXNBLGAME-26FEB190130CARNZB-NZB"    
+    # client.place_no_order(market_ticker, 1, 2)
+    # print(client.get_resting_no_orders(market_ticker))
+    print(client.get_no_position(market_ticker))
+    
 if __name__ == "__main__":
     main()
