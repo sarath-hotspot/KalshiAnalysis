@@ -32,7 +32,7 @@ REQUEST_DELAY = 0.25  # seconds between paginated requests to stay polite
 OUTPUT_FILE = Path(__file__).with_name("kalshi_sports_data.csv")
 STATE_FILE = Path(__file__).with_name("kalshi_fetch_state.json")
 FIELDNAMES = ["SeriesTicker", "SeriesName", "EventTicker", "MarketTicker", "Time",
-              "EventEndTime", "VolumeInDollar", "OpenInterest", "YesProb", "NoProb", "EventResult",
+              "EventEndTime", "VolumeInDollar", "VolumeAtSnapshot", "OpenInterest", "YesProb", "NoProb", "EventResult",
               "RulesPrimary", "KalshiURL", "Tags"]
 
 logging.basicConfig(
@@ -120,14 +120,18 @@ def get_basketball_series() -> list[dict]:
     return basketball
 
 
-def get_settled_markets(series_ticker: str, limit=1000) -> list[dict]:
-    """Return settled markets for a given series ticker."""
-    return paginate(
+def get_settled_markets(series_ticker: str, limit=0) -> list[dict]:
+    """Return settled markets for a given series ticker.
+    limit=0 means fetch all; otherwise stop after *limit* markets."""
+    markets = paginate(
         "/markets",
         "markets",
         params={"series_ticker": series_ticker, "status": "settled"},
-        limit=limit,
+        limit=200,  # per-page size (API max is 1000, 200 is safe)
     )
+    if limit:
+        return markets[:limit]
+    return markets
 
 
 def _extract_price(candle: dict) -> int | None:
@@ -209,6 +213,41 @@ def compute_volume_dollars(market: dict) -> str:
     vol = market.get("volume", 0)
     notional_cents = market.get("notional_value", 100)  # default $1 contract
     return f"{vol * notional_cents / 100:.2f}"
+
+
+def get_volume_before_close(series_ticker: str, market: dict, hours_before: float = 6) -> float:
+    """
+    Sum candlestick volume_fp (dollar volume) from market creation up to
+    *hours_before* hours before the market's close_time.  Returns total
+    dollar volume up to the snapshot point, or 0.0 if unavailable.
+    """
+    close_time_str = market.get("close_time")
+    open_time_str = market.get("open_time") or market.get("created_time")
+    if not close_time_str or not open_time_str:
+        return 0
+
+    close_dt = datetime.fromisoformat(close_time_str.replace("Z", "+00:00"))
+    open_dt = datetime.fromisoformat(open_time_str.replace("Z", "+00:00"))
+    cutoff_dt = close_dt - timedelta(hours=hours_before)
+
+    start_ts = int(open_dt.timestamp())
+    end_ts = int(cutoff_dt.timestamp())
+
+    if end_ts <= start_ts:
+        return 0
+
+    data = _get(
+        f"/series/{series_ticker}/markets/{market['ticker']}/candlesticks",
+        params={
+            "start_ts": start_ts,
+            "end_ts": end_ts,
+            "period_interval": 60,  # 1-hour candles
+        },
+    )
+
+    candles = data.get("candlesticks", [])
+    total_volume = sum(float(c.get("volume_fp", 0) or 0) for c in candles)
+    return total_volume
 
 
 # ---------------------------------------------------------------------------
@@ -336,7 +375,7 @@ def main():
         log.info("[%d/%d] Series: %s – %s",
                  idx, len(sports_series), sticker, series.get("title", ""))
 
-        markets = get_settled_markets(sticker, limit=args.limit_markets if args.limit_markets else 1000)
+        markets = get_settled_markets(sticker, limit=args.limit_markets if args.limit_markets else 0)
         log.info("  Found %d settled markets.", len(markets))
 
         if args.limit_markets:
@@ -364,6 +403,8 @@ def main():
                 log.warning("    No candlestick price data at all for %s – skipping.", ticker)
                 continue
 
+            volume_at_snapshot = get_volume_before_close(sticker, mkt, args.hours_before)
+
             no_prob = round(1.0 - yes_prob, 4)
 
             tags = mkt.get("tags", []) or series.get("tags", [])
@@ -377,6 +418,7 @@ def main():
                 "Time": snap_time,
                 "EventEndTime": close_time,
                 "VolumeInDollar": volume_dollars,
+                "VolumeAtSnapshot": volume_at_snapshot,
                 "OpenInterest": open_interest,
                 "YesProb": yes_prob,
                 "NoProb": no_prob,
