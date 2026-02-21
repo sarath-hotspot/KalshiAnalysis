@@ -20,6 +20,8 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 import requests
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -32,7 +34,8 @@ REQUEST_DELAY = 0.25  # seconds between paginated requests to stay polite
 OUTPUT_FILE = Path(__file__).with_name("kalshi_sports_data.csv")
 STATE_FILE = Path(__file__).with_name("kalshi_fetch_state.json")
 FIELDNAMES = ["SeriesTicker", "SeriesName", "EventTicker", "MarketTicker", "Time",
-              "EventEndTime", "VolumeInDollar", "VolumeAtSnapshot", "OpenInterest", "YesProb", "NoProb", "EventResult",
+              "EventEndTime", "VolumeInDollar", "VolumeAtSnapshot", "OHLCV_5m",
+              "OpenInterest", "YesProb", "NoProb", "EventResult",
               "RulesPrimary", "KalshiURL", "Tags"]
 
 logging.basicConfig(
@@ -42,6 +45,7 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 session = requests.Session()
+session.verify = False  # Disable SSL verification (for Fiddler proxy inspection)
 session.headers.update({"Accept": "application/json"})
 
 
@@ -250,6 +254,82 @@ def get_volume_before_close(series_ticker: str, market: dict, hours_before: floa
     return total_volume
 
 
+def get_ohlcv_5m(series_ticker: str, market: dict, hours_window: float = 6) -> str:
+    """
+    Build 5-min OHLCV bars for the last *hours_window* hours before market close.
+
+    Fetches 1-min candlesticks and aggregates every 5 into OHLCV bars.
+    Prices are the yes-probability (close price from the candle, in cents 0-100).
+
+    Returns a JSON string: list of objects, each with keys
+    {"ts", "o", "h", "l", "c", "v"} where:
+      ts = end timestamp of the 5-min window (epoch seconds)
+      o  = open price (first 1-min candle's open)
+      h  = high price (max across 1-min candles)
+      l  = low price  (min across 1-min candles)
+      c  = close price (last 1-min candle's close)
+      v  = volume in dollars (sum of volume_fp)
+
+    Returns "" if data is unavailable.
+    """
+    import json as _json
+
+    close_time_str = market.get("close_time")
+    if not close_time_str:
+        return ""
+
+    close_dt = datetime.fromisoformat(close_time_str.replace("Z", "+00:00"))
+    window_start_dt = close_dt - timedelta(hours=hours_window)
+
+    window_start_ts = int(window_start_dt.timestamp())
+    close_ts = int(close_dt.timestamp())
+
+    # Fetch 1-min candles for the window
+    data = _get(
+        f"/series/{series_ticker}/markets/{market['ticker']}/candlesticks",
+        params={
+            "start_ts": window_start_ts,
+            "end_ts": close_ts,
+            "period_interval": 1,  # 1-minute candles
+        },
+    )
+    candles_1m = data.get("candlesticks", [])
+    if not candles_1m:
+        return ""
+
+    # Sort chronologically
+    candles_1m.sort(key=lambda c: c.get("end_period_ts", 0))
+
+    # Helper to safely extract price fields
+    def _price(candle, field):
+        p = candle.get("price", {})
+        if isinstance(p, dict):
+            return float(p.get(field, 0) or 0)
+        return 0.0
+
+    # Aggregate into 5-min OHLCV bars
+    bars = []
+    for i in range(0, len(candles_1m), 5):
+        chunk = candles_1m[i : i + 5]
+        bar_open  = _price(chunk[0], "open")
+        bar_high  = max(_price(c, "high") for c in chunk)
+        bar_low   = min(_price(c, "low") for c in chunk)
+        bar_close = _price(chunk[-1], "close")
+        bar_vol   = round(sum(float(c.get("volume_fp", 0) or 0) for c in chunk), 2)
+        bar_ts    = chunk[-1].get("end_period_ts", 0)
+
+        bars.append({
+            "ts": bar_ts,
+            "o": bar_open,
+            "h": bar_high,
+            "l": bar_low,
+            "c": bar_close,
+            "v": bar_vol,
+        })
+
+    return _json.dumps(bars, separators=(",", ":"))
+
+
 # ---------------------------------------------------------------------------
 # State helpers
 # ---------------------------------------------------------------------------
@@ -322,6 +402,12 @@ def main():
         type=float,
         default=6,
         help="Snapshot probability N hours before market close (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--ohlcv-hours",
+        type=float,
+        default=6,
+        help="OHLCV 5-min window: fetch this many hours of candles before market close (default: %(default)s).",
     )
     args = parser.parse_args()
 
@@ -404,6 +490,7 @@ def main():
                 continue
 
             volume_at_snapshot = get_volume_before_close(sticker, mkt, args.hours_before)
+            ohlcv_5m = get_ohlcv_5m(sticker, mkt, args.ohlcv_hours)
 
             no_prob = round(1.0 - yes_prob, 4)
 
@@ -419,6 +506,7 @@ def main():
                 "EventEndTime": close_time,
                 "VolumeInDollar": volume_dollars,
                 "VolumeAtSnapshot": volume_at_snapshot,
+                "OHLCV_5m": ohlcv_5m,
                 "OpenInterest": open_interest,
                 "YesProb": yes_prob,
                 "NoProb": no_prob,

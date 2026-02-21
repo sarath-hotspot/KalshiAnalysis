@@ -410,27 +410,39 @@ def run(client: KalshiClient, *,
 
         # 5 — Refresh market data for latest prices before ordering
         fresh = client.get_market(ticker)
-        fresh_no_cents = _no_price_cents(fresh)
         fresh_yes_p = _yes_prob(fresh)
-        if fresh_no_cents != no_p_cents:
-            log.info("     Price refreshed: NO %d¢ → %d¢, YES %.1f%% → %.1f%%",
-                     no_p_cents, fresh_no_cents, yes_p * 100, fresh_yes_p * 100)
-        if fresh_no_cents <= 0:
-            log.warning("     SKIP  refreshed NO price is 0")
+
+        # Use the NO ask so the order fills immediately
+        fresh_no_bid = fresh.get("no_bid") or 0
+        fresh_no_ask = fresh.get("no_ask") or 0
+        log.info("     Refreshed: NO bid=%d¢  ask=%d¢  YES=%.1f%%",
+                 fresh_no_bid, fresh_no_ask, fresh_yes_p * 100)
+
+        if fresh_no_ask <= 0:
+            log.warning("     SKIP  NO ask is 0 (no liquidity)")
             continue
 
+        # Guard: only cross the spread if bid-ask spread <= 2¢
+        spread = fresh_no_ask - fresh_no_bid
+        if fresh_no_bid > 0 and spread > 2:
+            log.info("     SKIP  bid-ask spread %d¢ > 2¢ limit (bid=%d¢ ask=%d¢)",
+                     spread, fresh_no_bid, fresh_no_ask)
+            continue
+
+        order_price = fresh_no_ask
+
         # Recalculate count with fresh price
-        desired = bet_contracts if bet_contracts > 0 else max(int(bet_amount * 100) // fresh_no_cents, 1)
+        desired = bet_contracts if bet_contracts > 0 else max(int(bet_amount * 100) // order_price, 1)
         missing = max(desired - existing, 1)
 
-        # 6 — Place order
+        # 6 — Place order at the ask for immediate fill
         if dry_run:
-            log.info("     [DRY RUN] would BUY %d NO on %s @ %d¢", missing, ticker, fresh_no_cents)
+            log.info("     [DRY RUN] would BUY %d NO on %s @ %d¢ (ask)", missing, ticker, order_price)
             bets_placed += 1
         else:
-            result = client.place_no_order(ticker, missing, fresh_no_cents)
+            result = client.place_no_order(ticker, missing, order_price)
             if result:
-                log.info("     OK  order submitted (%d NO)", missing)
+                log.info("     OK  order submitted (%d NO @ %d¢ ask)", missing, order_price)
                 bets_placed += 1
             else:
                 log.error("     FAIL  order rejected for %s", ticker)
