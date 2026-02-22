@@ -14,7 +14,6 @@ from pathlib import Path
 DATA_FILE = Path(__file__).with_name("kalshi_sports_data.csv")
 
 CONFIDENCE_THRESHOLDS = [50, 55, 60, 65, 70, 75, 80, 85, 90]
-VOLUME_THRESHOLDS = [0, 1_000, 10_000, 100_000, 500_000, 1_000_000]
 VOLUME_SNAPSHOT_THRESHOLDS = [0, 1_000, 10_000, 100_000, 500_000, 1_000_000]
 OPEN_INTEREST_THRESHOLDS = [0, 100, 500, 1_000, 5_000, 10_000, 50_000]
 
@@ -85,7 +84,75 @@ def accuracy_at_threshold(rows: list[dict], lower: int, upper: int) -> dict:
         "correct": correct,
         "incorrect": incorrect,
         "accuracy": (correct / total * 100) if total else 0,
+        "lower": lower,
+        "upper": upper,
     }
+
+
+def _strategy_pnl(stats: dict) -> tuple[float, float, float, float]:
+    """Return (yes_cost, yes_pnl, no_cost, no_pnl) in dollars for a given stats row.
+
+    Yes strategy: buy YES at `upper` cents (worst-case price in the band).
+      cost = total * upper cents
+      win  = correct * 100 cents
+      pnl  = win - cost
+
+    No strategy: buy NO at (100 - lower) cents (worst-case price in the band).
+      cost = total * (100 - lower) cents
+      win  = wrong * 100 cents   (favourite lost → NO wins, paid $1)
+      pnl  = win - cost
+    """
+    upper = stats["upper"]
+    lower = stats["lower"]
+    correct = stats["correct"]
+    wrong = stats["incorrect"]
+    total = correct + wrong
+
+    yes_cost = (total * upper) / 100.0
+    yes_pnl = (correct * 100 - total * upper) / 100.0
+
+    no_cost = (total * (100 - lower)) / 100.0
+    no_pnl = (wrong * 100 - total * (100 - lower)) / 100.0
+    return yes_cost, yes_pnl, no_cost, no_pnl
+
+
+def _fmt_pnl(v: float) -> str:
+    """Format a dollar P&L value with sign and colour-neutral alignment."""
+    return f"${v:>+.2f}"
+
+
+def _fmt_cost(v: float) -> str:
+    """Format a dollar cost value (always positive, no sign)."""
+    return f"${v:>.2f}"
+
+
+def _print_stats_table(table: list[dict], cumulative: dict, cumulative_all: dict) -> None:
+    """Shared helper to print a confidence-band table with strategy P&L columns."""
+    hdr = (f"{'Confidence':<14} {'Total':>6} {'Correct':>8} {'Wrong':>6} "
+           f"{'Accuracy':>9} {'Yes_Cost':>10} {'Yes_PnL':>11} {'No_Cost':>10} {'No_PnL':>11}")
+    sep = "-" * len(hdr)
+    print(hdr)
+    print(sep)
+    for s in table:
+        yc, yp, nc, np_ = _strategy_pnl(s)
+        print(f"{s['range']:<14} {s['total']:>6} {s['correct']:>8} {s['incorrect']:>6} "
+              f"{s['accuracy']:>8.2f}% {_fmt_cost(yc):>10} {_fmt_pnl(yp):>11} {_fmt_cost(nc):>10} {_fmt_pnl(np_):>11}")
+    print(sep)
+    # Sum across all bands for cumulative rows
+    cum_yc = sum(_strategy_pnl(s)[0] for s in table if s["upper"] <= 90)
+    cum_yp = sum(_strategy_pnl(s)[1] for s in table if s["upper"] <= 90)
+    cum_nc = sum(_strategy_pnl(s)[2] for s in table if s["upper"] <= 90)
+    cum_np = sum(_strategy_pnl(s)[3] for s in table if s["upper"] <= 90)
+    print(f"{cumulative['range']:<14} {cumulative['total']:>6} {cumulative['correct']:>8} "
+          f"{cumulative['incorrect']:>6} {cumulative['accuracy']:>8.2f}% "
+          f"{_fmt_cost(cum_yc):>10} {_fmt_pnl(cum_yp):>11} {_fmt_cost(cum_nc):>10} {_fmt_pnl(cum_np):>11}")
+    total_yc = sum(_strategy_pnl(s)[0] for s in table)
+    total_yp = sum(_strategy_pnl(s)[1] for s in table)
+    total_nc = sum(_strategy_pnl(s)[2] for s in table)
+    total_np = sum(_strategy_pnl(s)[3] for s in table)
+    print(f"{cumulative_all['range']:<16} {cumulative_all['total']:>4} {cumulative_all['correct']:>8} "
+          f"{cumulative_all['incorrect']:>6} {cumulative_all['accuracy']:>8.2f}% "
+          f"{_fmt_cost(total_yc):>10} {_fmt_pnl(total_yp):>11} {_fmt_cost(total_nc):>10} {_fmt_pnl(total_np):>11}")
 
 
 def _volume(row: dict) -> float:
@@ -154,55 +221,7 @@ def print_accuracy_table(rows: list[dict]) -> None:
     cumulative_all["range"] = "ALL (incl >90%)"
 
     # Print table
-    hdr = f"{'Confidence':<14} {'Total':>6} {'Correct':>8} {'Wrong':>6} {'Accuracy':>9}"
-    sep = "-" * len(hdr)
-    print(hdr)
-    print(sep)
-    for s in table:
-        print(f"{s['range']:<14} {s['total']:>6} {s['correct']:>8} {s['incorrect']:>6} {s['accuracy']:>8.2f}%")
-    print(sep)
-    print(f"{cumulative['range']:<14} {cumulative['total']:>6} {cumulative['correct']:>8} {cumulative['incorrect']:>6} {cumulative['accuracy']:>8.2f}%")
-    print(f"{cumulative_all['range']:<16} {cumulative_all['total']:>4} {cumulative_all['correct']:>8} {cumulative_all['incorrect']:>6} {cumulative_all['accuracy']:>8.2f}%")
-
-
-def print_confidence_for_volume_ranges(rows: list[dict]) -> None:
-    """Print a confidence-band accuracy table for each volume range."""
-    for i, vol_lo in enumerate(VOLUME_THRESHOLDS):
-        vol_hi = VOLUME_THRESHOLDS[i + 1] if i + 1 < len(VOLUME_THRESHOLDS) else float("inf")
-        label = f"{_fmt_vol(vol_lo)}-{_fmt_vol(vol_hi)}" if vol_hi != float("inf") else f">{_fmt_vol(vol_lo)}"
-
-        subset = [r for r in rows if vol_lo <= _volume(r) < vol_hi]
-        if not subset:
-            print(f"\n=== Volume {label}: 0 markets — skipping ===")
-            continue
-
-        competitive = [r for r in subset if _favourite_prob(r) <= 0.90]
-        done_games = len(subset) - len(competitive)
-
-        print(f"\n=== Volume {label} ===")
-        print(f"Markets: {len(subset)} | Competitive: {len(competitive)} | Done games (>90%): {done_games}\n")
-
-        table = []
-        for j, lo in enumerate(CONFIDENCE_THRESHOLDS):
-            hi = CONFIDENCE_THRESHOLDS[j + 1] if j + 1 < len(CONFIDENCE_THRESHOLDS) else 100
-            source = subset if lo >= 90 else competitive
-            stats = accuracy_at_threshold(source, lo, hi)
-            table.append(stats)
-
-        cumulative = accuracy_at_threshold(competitive, 50, 100)
-        cumulative["range"] = "ALL >50%"
-        cumulative_all = accuracy_at_threshold(subset, 50, 100)
-        cumulative_all["range"] = "ALL (incl >90%)"
-
-        hdr = f"{'Confidence':<14} {'Total':>6} {'Correct':>8} {'Wrong':>6} {'Accuracy':>9}"
-        sep = "-" * len(hdr)
-        print(hdr)
-        print(sep)
-        for s in table:
-            print(f"{s['range']:<14} {s['total']:>6} {s['correct']:>8} {s['incorrect']:>6} {s['accuracy']:>8.2f}%")
-        print(sep)
-        print(f"{cumulative['range']:<14} {cumulative['total']:>6} {cumulative['correct']:>8} {cumulative['incorrect']:>6} {cumulative['accuracy']:>8.2f}%")
-        print(f"{cumulative_all['range']:<16} {cumulative_all['total']:>4} {cumulative_all['correct']:>8} {cumulative_all['incorrect']:>6} {cumulative_all['accuracy']:>8.2f}%")
+    _print_stats_table(table, cumulative, cumulative_all)
 
 
 def print_confidence_for_open_interest_ranges(rows: list[dict]) -> None:
@@ -234,15 +253,7 @@ def print_confidence_for_open_interest_ranges(rows: list[dict]) -> None:
         cumulative_all = accuracy_at_threshold(subset, 50, 100)
         cumulative_all["range"] = "ALL (incl >90%)"
 
-        hdr = f"{'Confidence':<14} {'Total':>6} {'Correct':>8} {'Wrong':>6} {'Accuracy':>9}"
-        sep = "-" * len(hdr)
-        print(hdr)
-        print(sep)
-        for s in table:
-            print(f"{s['range']:<14} {s['total']:>6} {s['correct']:>8} {s['incorrect']:>6} {s['accuracy']:>8.2f}%")
-        print(sep)
-        print(f"{cumulative['range']:<14} {cumulative['total']:>6} {cumulative['correct']:>8} {cumulative['incorrect']:>6} {cumulative['accuracy']:>8.2f}%")
-        print(f"{cumulative_all['range']:<16} {cumulative_all['total']:>4} {cumulative_all['correct']:>8} {cumulative_all['incorrect']:>6} {cumulative_all['accuracy']:>8.2f}%")
+        _print_stats_table(table, cumulative, cumulative_all)
 
 
 def print_confidence_for_volume_snapshot_ranges(rows: list[dict]) -> None:
@@ -274,25 +285,13 @@ def print_confidence_for_volume_snapshot_ranges(rows: list[dict]) -> None:
         cumulative_all = accuracy_at_threshold(subset, 50, 100)
         cumulative_all["range"] = "ALL (incl >90%)"
 
-        hdr = f"{'Confidence':<14} {'Total':>6} {'Correct':>8} {'Wrong':>6} {'Accuracy':>9}"
-        sep = "-" * len(hdr)
-        print(hdr)
-        print(sep)
-        for s in table:
-            print(f"{s['range']:<14} {s['total']:>6} {s['correct']:>8} {s['incorrect']:>6} {s['accuracy']:>8.2f}%")
-        print(sep)
-        print(f"{cumulative['range']:<14} {cumulative['total']:>6} {cumulative['correct']:>8} {cumulative['incorrect']:>6} {cumulative['accuracy']:>8.2f}%")
-        print(f"{cumulative_all['range']:<16} {cumulative_all['total']:>4} {cumulative_all['correct']:>8} {cumulative_all['incorrect']:>6} {cumulative_all['accuracy']:>8.2f}%")
+        _print_stats_table(table, cumulative, cumulative_all)
 
 
 def main():
     rows = load_data(DATA_FILE)
     print(f"Loaded {len(rows)} rows from {DATA_FILE.name}\n")
     print_accuracy_table(rows)
-    print("\n" + "=" * 60)
-    print("  ANALYSIS BY VOLUME")
-    print("=" * 60)
-    print_confidence_for_volume_ranges(rows)
     print("\n" + "=" * 60)
     print("  ANALYSIS BY OPEN INTEREST")
     print("=" * 60)
